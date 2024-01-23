@@ -1,0 +1,179 @@
+using CUDA, Random, DataFrames, Base.Threads, ProgressMeter, StatsBase, CSV
+
+function generate_lottery_numbers(n_draw::Int, numbers_out, highest_num)
+    gpu_numbers = CUDA.zeros(Float32, numbers_out, n_draw) # Holding matrix
+    CUDA.rand!(CUDA.CURAND.RNG(), gpu_numbers) # Generate random numbers
+    gpu_numbers .= floor.(gpu_numbers .* highest_num) .+ 1 # Scales number between 1 and 50 or 12 
+    cpu_numbers = Array(gpu_numbers)  # Convert to Array for cpu 
+    cpu_numbers = Int32.(cpu_numbers)  # Convert the elements to Int32
+    return cpu_numbers
+end
+
+
+function check_duplicates_in_rows(matrix)
+    matrix = CuArray(matrix) # moves into gpu
+    function kernel(matrix, result) 
+        row = threadIdx().x + (blockIdx().x - 1) * blockDim().x #setup of rows 
+        if row <= size(matrix, 1) #
+            for i in 1:size(matrix, 2)
+                for j in i+1:size(matrix, 2)
+                    if matrix[row, i] == matrix[row, j] # check if element is same
+                        result[row] = true
+                        return
+                    end
+                end
+            end
+        end
+    end
+
+    # Convert result array to CuArray
+    result = CUDA.fill(false, size(matrix, 1)) # Working vec
+    # Launch the kernel
+    @cuda threads=1024 blocks=ceil(Int, size(matrix, 1) / 256) kernel(matrix, result) #calls cuda
+    result = Array(result) # convert to cpu 
+    return result
+end
+
+function dual_lotto(runs)
+    share_load = runs÷2 # When runnin dev all by two, share workload
+    x, y = nothing, nothing #Holding vec
+    @sync begin # Setup for dual gpu
+        @async begin
+            device!(0) # set device 
+            ran_mat = generate_lottery_numbers(5,share_load,50) # 5 nums, half load, max num 50
+            omit_vec = check_duplicates_in_rows(ran_mat) # check if dup elements
+            x = ran_mat[.!omit_vec, :] # Omit vecs with dup elements 
+            extra_numbers = generate_lottery_numbers(2,size(x,1),12) # generate euro nums 
+            x = hcat(x, extra_numbers) # combine
+        end
+        @async begin # Same but for gpu 1 (number 2)
+            device!(1)
+            ran_mat = generate_lottery_numbers(5,share_load,50)
+            omit_vec = check_duplicates_in_rows(ran_mat)
+            y = ran_mat[.!omit_vec, :]
+            extra_numbers = generate_lottery_numbers(2,size(y,1),12)
+            y = hcat(y, extra_numbers)
+        end
+    end
+
+    out = vcat(y,x)
+    return out
+end
+
+#Selects x amount of rows from our large lottoframe 
+function lotto_machine(data, rows_to_keep)
+    sel_rows = randperm(size(data, 1))[1:rows_to_keep] # Ran non repeat nums 
+    lotto_draws = data[sel_rows, :] #select those nums
+    return lotto_draws
+end
+
+# same as above, but we need tickets. (Redundant when i see it now)
+function ticket_machine(data, rows_to_keep)
+    sel_rows = randperm(size(data, 1))[1:rows_to_keep]
+    tickets = data[sel_rows, :]
+    return tickets
+end
+
+# Cuda Kernel to compare lottery vs tickets 
+function compare_lottery_kernel(draws, tickets, output)
+    draw_idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x #Set the draw 
+    ticket_idx = (blockIdx().y - 1) * blockDim().y + threadIdx().y # Set ticket
+
+    if draw_idx <= size(draws, 1) && ticket_idx <= size(tickets, 1) # Check for size 
+        normal_matches = count(i -> draws[draw_idx, i] == tickets[ticket_idx, i], 1:5) # compare all nums with the 1-5 nums 
+        extra_matches = count(i -> draws[draw_idx, i + 5] == tickets[ticket_idx, i + 5], 1:2) # compares euro nums
+
+        # Calculate the output index for normal and extra matches
+        output_idx_normal = (ticket_idx - 1) * 2 + 1 
+        output_idx_extra = (ticket_idx - 1) * 2 + 2
+
+        # Assign normal_matches and extra_matches to the output array
+        output[draw_idx, output_idx_normal] = normal_matches
+        output[draw_idx, output_idx_extra] = extra_matches
+    end
+    return
+end
+
+function compare_lottery(draws, tickets)
+    # draws_gpu and tickets_gpu are same but moved to gpu
+    draws_gpu = CuArray(draws)
+    tickets_gpu = CuArray(tickets)
+
+    # Each ticket will have two columns: one for normal and one for extra matches
+    output_gpu = CUDA.zeros(Int, size(draws, 1), 2 * size(tickets, 1)) #holding vec
+
+    # Define the block and grid size
+    threads_per_block = (16, 16)  #  block size
+    blocks = (ceil(Int, size(draws, 1) / threads_per_block[1]), 
+              ceil(Int, size(tickets, 1) / threads_per_block[2]))
+
+    @cuda threads=threads_per_block blocks=blocks compare_lottery_kernel(draws_gpu, tickets_gpu, output_gpu)
+
+    # Collect and return the result
+    return CUDA.collect(output_gpu)
+end
+
+#formating our matrix to have two cols, no description needed
+function fix_columns(data) 
+    odd_columns = data[:, 1:2:size(data, 2)]
+    even_columns = data[:, 2:2:size(data, 2)]
+    odd_vector = reshape(odd_columns, :)
+    even_vector = reshape(even_columns, :)
+    result = hcat(odd_vector, even_vector) 
+    return result
+end
+
+function count_unique(matrix)
+    match_counts = Dict() # holding vec
+    u_comb = [] #unique combs
+    
+    for i in 0:5
+        for j in 0:2
+            match_counts[(i, j)] = 0 # all combs for keys
+            push!(u_comb, (i, j)) # All combs 
+        end
+    end
+    
+    # Iterate through the rows and count occurrences of desired combinations
+    for row in eachrow(matrix)
+        for combination in u_comb
+            if combination == (row[1], row[2])  # Compare with the tuple (row[1], row[2])
+                match_counts[combination] += 1
+            end
+        end
+    end
+    match_counts = Dict(Symbol(k) => v for (k, v) in match_counts) # Converting to df
+    df = DataFrame(match_counts)
+    return df
+end
+
+function monte_carlo_combined(data, draws, ticks)
+    draws_matrix = lotto_machine(data, draws) # We draw from big table 
+    tickets_matrix = ticket_machine(data, ticks) # Tickets from big table 
+    matches = compare_lottery(draws_matrix, tickets_matrix) # compare the two 
+    propper_format = fix_columns(matches) # fix cols  
+    result = count_unique(propper_format) # Counting information
+    path = "/home/nnx/Documents/Coding/lotto_ran_stock/cuda_runs/"
+    csv_filename = string(path, ticks, "_tick_", draws, ".csv")
+    CSV.write(csv_filename, result) # Saves 
+    return
+end
+
+function main_mc()
+    lotto_frame = dual_lotto(1_000_000_000) # Creating the large simulation 
+    no_tickets = [2, 4, 6, 10, 20, 50, 100, 1_000] # no of entries to lottery
+    lotto_draws = [50_000, 100_000, 1_000_000, 10_000_000, 100_000_000, 250_000_000] # no of draws from big simulation
+    counter = 0 # counter to check
+    all_combs = size(lotto_draws,1) * size(no_tickets,1) # all u combs 
+
+    @threads for ticks in no_tickets #multi threading
+        @threads    for draws in lotto_draws
+            counter += 1
+            monte_carlo_combined(lotto_frame, draws, ticks) # Runs the sim per unique combination
+            println(counter, "/", all_combs, " @ ", ticks," - ", draws)
+        end
+    end
+end
+
+main_mc()
+

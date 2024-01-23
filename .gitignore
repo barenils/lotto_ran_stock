@@ -1,0 +1,8 @@
+# Julia-specific
+/cuda_runs
+/pics 
+/save
+data_fill.jl
+plot_8.svg
+random_stocks.jl
+xx_junk_xgboost.regression_forescating.jl
